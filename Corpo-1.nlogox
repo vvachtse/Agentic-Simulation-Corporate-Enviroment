@@ -1,0 +1,1682 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code><![CDATA[;; ============================================================
+;;  CORPORATE SIMULATION — Agent-Based Model  v7
+;;  Breeds: juniors (J), mids (M), seniors (S), managers (P)
+;;
+;;  Changes from v6:
+;;    - Scaled cost raises by class multiplier + experience
+;;    - Smooth per-tick raises (no lump sum every 100 ticks)
+;;    - Hard pyramid caps: max-mids <= 5x seniors,
+;;                         max-juniors <= 5x mids
+;;    - Budget doubling decoupled from hiring thresholds
+;;      via budget-expansion-margin + budget-expansion-cooldown
+;;    - non-managers refreshed just before fatigue phase
+;;    - file-close guard in init-log
+;;    - current-maximal-cost internal variable (slider untouched)
+;; ============================================================
+
+breed [juniors  junior ]
+breed [mids     mid    ]
+breed [seniors  senior ]
+breed [managers manager]
+
+juniors-own  [ experience  fatigue  cost  profit  promotion-ready ]
+mids-own     [ experience  fatigue  cost  profit  promotion-ready ]
+seniors-own  [ experience  fatigue  cost  profit ]
+managers-own [ cost ]
+
+globals [
+  ;; Population counts
+  j-count  m-count  s-count
+
+  ;; Fatigue death counters
+  j-deaths  m-deaths  s-deaths
+
+  ;; Budget firing counters
+  j-fired  m-fired  s-fired
+
+  ;; Promotion counters
+  j-to-m-promotions
+  m-to-s-promotions
+
+  ;; Budget & Profit
+  total-cost
+  total-profit
+  current-maximal-cost
+
+  ;; Hiring cooldown trackers
+  last-hire-tick-j
+  last-hire-tick-m
+  last-hire-tick-s
+
+  ;; Budget expansion cooldown
+  last-budget-expansion-tick
+
+  ;; Dynamic workforce caps
+  dynamic-max-juniors
+  dynamic-max-mids
+  dynamic-max-seniors
+  last-expansion-tick
+
+  ;; Per-tick vacancy counters
+  m-vacancies
+  s-vacancies
+
+  ;; Cached non-manager agentset
+  non-managers
+
+  ;; Logging
+  logging-active
+  
+  
+]
+
+;; ============================================================
+;;  SETUP
+;; ============================================================
+
+to setup
+  clear-all
+
+  set j-deaths                 0
+  set m-deaths                 0
+  set s-deaths                 0
+  set j-fired                  0
+  set m-fired                  0
+  set s-fired                  0
+  set j-to-m-promotions        0
+  set m-to-s-promotions        0
+  set total-cost               0
+  set total-profit             0
+  set last-hire-tick-j        -1
+  set last-hire-tick-m        -1
+  set last-hire-tick-s        -1
+  set last-budget-expansion-tick -1
+  set m-vacancies              0
+  set s-vacancies              0
+  set last-expansion-tick     -1
+
+  ;; Seed internal budget from slider — slider never touched again
+  set current-maximal-cost maximal-cost
+
+  ;; Seed dynamic caps from sliders — grow from here
+  set dynamic-max-seniors max-seniors
+  set dynamic-max-mids    max-mids
+  set dynamic-max-juniors max-juniors
+
+  create-juniors  initial-juniors [ setup-junior  ]
+  create-mids     initial-mids    [ setup-mid     ]
+  create-seniors  initial-seniors [ setup-senior  ]
+  create-managers 1               [ setup-manager ]
+
+  ;; Initial metric pass
+  set non-managers (turtle-set juniors mids seniors)
+  set j-count      count juniors
+  set m-count      count mids
+  set s-count      count seniors
+  set total-cost   compute-cost
+  set total-profit compute-profit
+
+  init-log
+  reset-ticks
+end
+
+;; ---- Per-breed initializers --------------------------------
+
+to setup-junior
+  set experience      0
+  set fatigue         initial-fatigue-j
+  set cost            initial-cost-j
+  set profit          0
+  set promotion-ready false
+  setxy random-xcor random-ycor
+  set color  yellow
+  set shape  "person"
+  set size   1.0
+end
+
+to setup-mid
+  set experience      0
+  set fatigue         initial-fatigue-m
+  set cost            initial-cost-m
+  set profit          0
+  set promotion-ready false
+  setxy random-xcor random-ycor
+  set color  orange
+  set shape  "person"
+  set size   1.2
+end
+
+to setup-senior
+  set experience 0
+  set fatigue    initial-fatigue-s
+  set cost       initial-cost-s
+  set profit     0
+  setxy random-xcor random-ycor
+  set color  sky
+  set shape  "person"
+  set size   1.4
+end
+
+to setup-manager
+  set cost 0
+  setxy random-xcor random-ycor
+  set color  red
+  set shape  "person"
+  set size   1.8
+end
+
+;; ============================================================
+;;  REPORTERS — single-pass cost and profit
+;; ============================================================
+
+to-report compute-cost
+  let base-cost sum [ cost ] of juniors +
+                sum [ cost ] of mids    +
+                sum [ cost ] of seniors
+  let space-cost (count juniors + count mids + count seniors)
+                 * employee-space-cost
+  report base-cost + space-cost
+end
+
+to-report compute-profit
+  report sum [ profit ] of juniors +
+         sum [ profit ] of mids    +
+         sum [ profit ] of seniors
+end
+
+;; ============================================================
+;;  MAIN LOOP
+;; ============================================================
+
+to go
+  ;; Reset per-tick counters
+  set m-vacancies 0
+  set s-vacancies 0
+
+  ;; 1. Movement (local-first)
+  ask juniors  [ move-junior  ]
+  ask mids     [ move-mid     ]
+  ask seniors  [ move-senior  ]
+  ask managers [ move-manager ]
+
+  ;; 2. Interactions (manager-boosted XP)
+  ask juniors [ interact-as-junior ]
+  ask mids    [ interact-as-mid    ]
+
+  ;; 3. Mark promotion-ready (one-time flag + fatigue doubling)
+  mark-promotion-ready
+
+  ;; 4. Refresh non-managers just before fatigue phase
+  ;;    so newly created agents are always included in morale hits
+  set non-managers (turtle-set juniors mids seniors)
+
+  ;; 5. Fatigue / death (morale hit + vacancy tracking)
+  ask juniors [ check-fatigue-junior ]
+  ask mids    [ check-fatigue-mid    ]
+  ask seniors [ check-fatigue-senior ]
+
+  ;; 6. Per-agent profit (single pass)
+  compute-profits
+
+  ;; 7. Smooth scaled cost raise — every tick, no lump sums
+  increase-costs
+
+  ;; 8. Population floor / ceiling
+  enforce-limits
+
+  ;; 9. Budget enforcement (incremental)
+  enforce-budget
+
+  ;; 10. Fill promotion vacancies (best profit first)
+  fill-promotions
+
+  ;; 11. Budget self-regulation (decoupled expand vs downsize)
+  maximal-cost-self-regulation
+
+  ;; 12. Tiered profit-based hiring (sensitive thresholds)
+  profit-based-hiring
+
+  ;; 13. Dynamic cap expansion (pyramid-clamped)
+  adjust-max-employees
+
+  ;; 14. Single metric refresh at end of tick
+  set j-count      count juniors
+  set m-count      count mids
+  set s-count      count seniors
+  set total-cost   compute-cost
+  set total-profit compute-profit
+
+  ;; 15. Plots + CSV
+  do-plots
+  log-tick-data
+
+  tick
+end
+
+;; ============================================================
+;;  MOVEMENT — local-first, global scan only as fallback
+;; ============================================================
+
+to move-junior
+  let local-mids mids in-radius seek-radius
+  ifelse any? local-mids [
+    face min-one-of local-mids [ distance myself ]
+    fd 1
+  ][
+    let t min-one-of mids [ distance myself ]
+    ifelse t != nobody [ face t  fd 1 ] [ wiggle ]
+  ]
+end
+
+to move-mid
+  let local-seniors seniors in-radius seek-radius
+  ifelse any? local-seniors [
+    face min-one-of local-seniors [ distance myself ]
+    fd 1
+  ][
+    let t min-one-of seniors [ distance myself ]
+    ifelse t != nobody [ face t  fd 1 ] [ wiggle ]
+  ]
+end
+
+to move-senior
+  let boss one-of managers
+  ifelse boss != nobody [ face boss  rt 180  fd 1 ] [ wiggle ]
+end
+
+to move-manager
+  let local-seniors seniors in-radius seek-radius
+  ifelse any? local-seniors [
+    face min-one-of local-seniors [ distance myself ]
+    fd 1
+  ][
+    let t min-one-of seniors [ distance myself ]
+    ifelse t != nobody [ face t  fd 1 ] [ wiggle ]
+  ]
+end
+
+to wiggle
+  rt random-float 60 - 30
+  fd 1
+end
+
+;; ============================================================
+;;  INTERACTIONS — manager presence boosts XP
+;; ============================================================
+
+to interact-as-junior
+  let nearby-mids mids in-radius interaction-radius
+  if any? nearby-mids [
+    let xp-gain ifelse-value (any? managers in-radius manager-radius)
+                             [ 1 + manager-effectiveness-boost ] [ 1 ]
+    set experience experience + xp-gain
+    ask nearby-mids [ set fatigue fatigue + fatigue-increment ]
+  ]
+end
+
+to interact-as-mid
+  let nearby-seniors seniors in-radius interaction-radius
+  if any? nearby-seniors [
+    let xp-gain ifelse-value (any? managers in-radius manager-radius)
+                             [ 1 + manager-effectiveness-boost ] [ 1 ]
+    set experience experience + xp-gain
+    ask nearby-seniors [ set fatigue fatigue + fatigue-increment ]
+  ]
+end
+
+;; ============================================================
+;;  PROMOTION READINESS
+;;  One-time trigger: fatigue doubles, agent turns lime.
+;;  Actual promotion waits for a vacancy above.
+;; ============================================================
+
+to mark-promotion-ready
+  ask juniors with [ not promotion-ready and
+                     experience >= j-experience-threshold ] [
+    set fatigue         fatigue * 2
+    set promotion-ready true
+    set color           lime
+  ]
+  ask mids with [ not promotion-ready and
+                  experience >= m-experience-threshold ] [
+    set fatigue         fatigue * 2
+    set promotion-ready true
+    set color           lime
+  ]
+end
+
+;; ============================================================
+;;  FATIGUE / DEATH
+;;  Guard: only draw random-normal if fatigue already exceeds
+;;         resilience threshold (cheap check first).
+;;  Morale hit uses cached non-managers agentset.
+;;  M and S deaths open a promotion vacancy.
+;; ============================================================
+
+to check-fatigue-junior
+  if fatigue > fatigue-resilience [
+    let stress random-normal 0 fatigue-std
+    if stress > fatigue [
+      ask (non-managers in-radius morale-hit-radius)
+          with [ self != myself ] [
+        set fatigue fatigue + morale-hit-amount
+      ]
+      set j-deaths j-deaths + 1
+      die
+    ]
+  ]
+end
+
+to check-fatigue-mid
+  if fatigue > fatigue-resilience [
+    let stress random-normal 0 fatigue-std
+    if stress > fatigue [
+      ask (non-managers in-radius morale-hit-radius)
+          with [ self != myself ] [
+        set fatigue fatigue + morale-hit-amount
+      ]
+      set m-vacancies m-vacancies + 1
+      set m-deaths    m-deaths    + 1
+      die
+    ]
+  ]
+end
+
+to check-fatigue-senior
+  if fatigue > fatigue-resilience [
+    let stress random-normal 0 fatigue-std
+    if stress > fatigue [
+      ask (non-managers in-radius morale-hit-radius)
+          with [ self != myself ] [
+        set fatigue fatigue + morale-hit-amount
+      ]
+      set s-vacancies s-vacancies + 1
+      set s-deaths    s-deaths    + 1
+      die
+    ]
+  ]
+end
+
+;; ============================================================
+;;  PROFIT SYSTEM
+;;  profit = (experience / 10) + class-multiplier * cost
+;;  Multipliers: J=1  M=2  S=4
+;; ============================================================
+
+to compute-profits
+  ask juniors [ set profit (experience / 10) + 1 * cost ]
+  ask mids    [ set profit (experience / 10) + 2 * cost ]
+  ask seniors [ set profit (experience / 10) + 4 * cost ]
+end
+
+;; ============================================================
+;;  COST RAISE — smooth, scaled by class and experience
+;;
+;;  raise-per-tick = (cost-increase / 100)
+;;                  * class-multiplier
+;;                  * (1 + experience / experience-cost-scale)
+;;
+;;  Applied every tick instead of a lump sum every 100 ticks.
+;;  class-multiplier: J=1  M=2  S=4
+;;  experience-cost-scale: slider dampening XP contribution
+;; ============================================================
+
+to increase-costs
+  ask juniors [
+    set cost cost + (cost-increase / 100) * 1
+                  * (1 + experience / experience-cost-scale)
+  ]
+  ask mids [
+    set cost cost + (cost-increase / 100) * 2
+                  * (1 + experience / experience-cost-scale)
+  ]
+  ask seniors [
+    set cost cost + (cost-increase / 100) * 4
+                  * (1 + experience / experience-cost-scale)
+  ]
+end
+
+;; ============================================================
+;;  BUDGET ENFORCEMENT — incremental, no repeated full sum
+;;  Subtracts each fired agent's cost directly from running-cost.
+;;  M and S firings open a promotion vacancy.
+;; ============================================================
+
+to enforce-budget
+  let running-cost compute-cost
+
+  while [ running-cost > current-maximal-cost ] [
+    let cost-removed 0
+
+    if count juniors > min-juniors [
+      let victim min-one-of juniors [ profit ]
+      if victim != nobody [
+        set cost-removed cost-removed + [cost] of victim
+                                      + employee-space-cost
+        ask victim [ set j-fired j-fired + 1  die ]
+      ]
+    ]
+
+    if count mids > min-mids [
+      let victim min-one-of mids [ profit ]
+      if victim != nobody [
+        set cost-removed cost-removed + [cost] of victim
+                                      + employee-space-cost
+        ask victim [
+          set m-vacancies m-vacancies + 1
+          set m-fired     m-fired     + 1
+          die
+        ]
+      ]
+    ]
+
+    if count seniors > min-seniors [
+      let victim min-one-of seniors [ profit ]
+      if victim != nobody [
+        set cost-removed cost-removed + [cost] of victim
+                                      + employee-space-cost
+        ask victim [
+          set s-vacancies s-vacancies + 1
+          set s-fired     s-fired     + 1
+          die
+        ]
+      ]
+    ]
+
+    set running-cost running-cost - cost-removed
+
+    ;; Safety exits
+    if cost-removed = 0 [ stop ]
+    if (count juniors <= min-juniors) and
+       (count mids    <= min-mids   ) and
+       (count seniors <= min-seniors) [ stop ]
+  ]
+end
+
+;; ============================================================
+;;  VACANCY-TRIGGERED PROMOTION
+;;  Best-profit promotion-ready agent fills each vacancy.
+;;  Agentset refreshed after each individual promotion.
+;; ============================================================
+
+to fill-promotions
+  ;; --- J -> M ---
+  let ready-js juniors with [ promotion-ready ]
+  let slots-m  min list m-vacancies (count ready-js)
+  repeat slots-m [
+    if any? ready-js [
+      ask max-one-of ready-js [ profit ] [
+        let px xcor  let py ycor
+        hatch-mids 1 [
+          set experience      0
+          set fatigue         initial-fatigue-m
+          set cost            initial-cost-m
+          set profit          0
+          set promotion-ready false
+          set color  orange  set shape "person"  set size 1.2
+          setxy px py
+        ]
+        set j-to-m-promotions j-to-m-promotions + 1
+        die
+      ]
+      set ready-js juniors with [ promotion-ready ]
+    ]
+  ]
+
+  ;; --- M -> S ---
+  let ready-ms mids with [ promotion-ready ]
+  let slots-s  min list s-vacancies (count ready-ms)
+  repeat slots-s [
+    if any? ready-ms [
+      ask max-one-of ready-ms [ profit ] [
+        let px xcor  let py ycor
+        hatch-seniors 1 [
+          set experience 0
+          set fatigue    initial-fatigue-s
+          set cost       initial-cost-s
+          set profit     0
+          set color  sky  set shape "person"  set size 1.4
+          setxy px py
+        ]
+        set m-to-s-promotions m-to-s-promotions + 1
+        die
+      ]
+      set ready-ms mids with [ promotion-ready ]
+    ]
+  ]
+end
+
+;; ============================================================
+;;  BUDGET SELF-REGULATION
+;;  Expansion uses budget-expansion-margin (high) +
+;;  budget-expansion-cooldown — completely decoupled from
+;;  hiring thresholds which are much more sensitive.
+;;  Downsizing remains reactive with no cooldown.
+;; ============================================================
+
+to maximal-cost-self-regulation
+  if (total-profit - total-cost) > (budget-expansion-margin * current-maximal-cost) and
+     (ticks - last-budget-expansion-tick) >= budget-expansion-cooldown [
+    set current-maximal-cost       current-maximal-cost * 2
+    set last-budget-expansion-tick ticks
+  ]
+
+  if (total-profit - total-cost) < (profit-margin * total-cost) and ticks > 100 [
+    set current-maximal-cost current-maximal-cost * downsize-rate
+  ]
+end
+
+;; ============================================================
+;;  TIERED PROFIT-BASED HIRING — uses sensitive thresholds
+;;  hire-profit-threshold-* sit well below budget-expansion-margin
+;;  so hiring fires many ticks before any budget doubling occurs.
+;; ============================================================
+
+to profit-based-hiring
+  if total-profit  > hire-profit-threshold-j and
+     total-cost    < current-maximal-cost    and
+     count juniors < dynamic-max-juniors     and
+     (ticks - last-hire-tick-j) >= hiring-cooldown [
+    create-juniors 1 [ setup-junior ]
+    set last-hire-tick-j ticks
+  ]
+
+  if total-profit > hire-profit-threshold-m and
+     total-cost   < current-maximal-cost    and
+     count mids   < dynamic-max-mids        and
+     (ticks - last-hire-tick-m) >= hiring-cooldown [
+    create-mids 1 [ setup-mid ]
+    set last-hire-tick-m ticks
+  ]
+
+  if total-profit  > hire-profit-threshold-s and
+     total-cost    < current-maximal-cost    and
+     count seniors < dynamic-max-seniors     and
+     (ticks - last-hire-tick-s) >= hiring-cooldown [
+    create-seniors 1 [ setup-senior ]
+    set last-hire-tick-s ticks
+  ]
+end
+
+;; ============================================================
+;;  DYNAMIC WORKFORCE CAP EXPANSION
+;;  Condition: total-profit > expansion-margin * total-cost
+;;             AND expansion-cooldown elapsed
+;;  Effect:    +1 senior cap, +5 mid cap, +25 junior cap
+;;  After expansion, pyramid ratios are hard-clamped:
+;;    dynamic-max-mids    <= dynamic-max-seniors * 5
+;;    dynamic-max-juniors <= dynamic-max-mids    * 5
+;;  Caps never fall below absolute minimums.
+;; ============================================================
+
+to adjust-max-employees
+  if total-cost > 0 and total-profit > expansion-margin * total-cost [
+    if (ticks - last-expansion-tick) >= expansion-cooldown [
+
+      set dynamic-max-seniors dynamic-max-seniors + 1
+      set dynamic-max-mids    dynamic-max-mids    + 5
+      set dynamic-max-juniors dynamic-max-juniors + 25
+
+      ;; Hard pyramid clamp — applied immediately after every expansion
+      set dynamic-max-mids
+        min list dynamic-max-mids (dynamic-max-seniors * 5)
+      set dynamic-max-juniors
+        min list dynamic-max-juniors (dynamic-max-mids * 5)
+
+      ;; Never drop below absolute minimums
+      set dynamic-max-mids    max list dynamic-max-mids    min-mids
+      set dynamic-max-juniors max list dynamic-max-juniors min-juniors
+
+      set last-expansion-tick ticks
+    ]
+  ]
+end
+
+;; ============================================================
+;;  POPULATION FLOOR / CEILING — uses dynamic caps
+;; ============================================================
+
+to enforce-limits
+  while [ count juniors < min-juniors ] [ create-juniors 1 [ setup-junior ] ]
+  if count juniors > dynamic-max-juniors [
+    ask n-of (count juniors - dynamic-max-juniors) juniors [ die ]
+  ]
+
+  while [ count mids < min-mids ] [ create-mids 1 [ setup-mid ] ]
+  if count mids > dynamic-max-mids [
+    ask n-of (count mids - dynamic-max-mids) mids [ die ]
+  ]
+
+  while [ count seniors < min-seniors ] [ create-seniors 1 [ setup-senior ] ]
+  if count seniors > dynamic-max-seniors [
+    ask n-of (count seniors - dynamic-max-seniors) seniors [ die ]
+  ]
+end
+
+;; ============================================================
+;;  PLOTS
+;;  Requires four plots in the Interface:
+;;    "Population"     pens: juniors / mids / seniors
+;;    "Financials"     pens: profit / cost
+;;    "Events"         pens: j-deaths / m-deaths / s-deaths /
+;;                           j-fired / m-fired / s-fired /
+;;                           j-to-m / m-to-s
+;;    "Workforce Caps" pens: max-j / max-m / max-s
+;; ============================================================
+
+to do-plots
+  set-current-plot "Population"
+  set-current-plot-pen "juniors"  plot j-count
+  set-current-plot-pen "mids"     plot m-count
+  set-current-plot-pen "seniors"  plot s-count
+
+  set-current-plot "Financials"
+  set-current-plot-pen "profit"  plot total-profit
+  set-current-plot-pen "cost"    plot total-cost
+
+end
+
+;; ============================================================
+;;  CSV LOGGING
+;;  File stays open between ticks — no open/close overhead.
+;;  init-log  : safely closes any open handle, deletes old file,
+;;              opens fresh file, writes header.
+;;  log-tick-data : writes one row per tick (no open/close).
+;;  stop-logging  : closes file safely before ending a run.
+;; ============================================================
+
+to init-log
+  ;; Safely close any open handle before touching the file
+  carefully [ file-close ] []
+  if file-exists? "simulation_log.csv" [ file-delete "simulation_log.csv" ]
+  file-open "simulation_log.csv"
+  file-print (word
+    "tick,"
+    "j-count,m-count,s-count,"
+    "total-cost,total-profit,"
+    "current-maximal-cost,"
+    "j-deaths,m-deaths,s-deaths,"
+    "j-fired,m-fired,s-fired,"
+    "j-to-m-promotions,m-to-s-promotions,"
+    "m-vacancies,s-vacancies,"
+    "dynamic-max-juniors,dynamic-max-mids,dynamic-max-seniors"
+  )
+  ;; File intentionally left open for efficient per-tick writes
+  set logging-active true
+end
+
+to log-tick-data
+  if not logging-active [ stop ]
+  file-print (word
+    ticks               ","
+    j-count             "," m-count             "," s-count             ","
+    total-cost          "," total-profit         ","
+    current-maximal-cost ","
+    j-deaths            "," m-deaths             "," s-deaths            ","
+    j-fired             "," m-fired              "," s-fired             ","
+    j-to-m-promotions   "," m-to-s-promotions    ","
+    m-vacancies         "," s-vacancies          ","
+    dynamic-max-juniors "," dynamic-max-mids     "," dynamic-max-seniors
+  )
+end
+
+to stop-logging
+  set logging-active false
+  file-close
+  print "Logging stopped. File saved as simulation_log.csv"
+end
+]]></code>
+  <widgets>
+    <view x="515" wrappingAllowedX="true" y="3" frameRate="30.0" minPycor="-16" height="439" showTickCounter="true" patchSize="13.2" fontSize="10" wrappingAllowedY="true" width="439" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <slider x="0" step="1" y="5" max="100" width="250" display="initial-juniors" height="50" min="0" direction="Horizontal" default="35.0" variable="initial-juniors"></slider>
+    <slider x="255" step="0.01" y="5" max="1" width="250" display="initial-fatigue-j" height="50" min="0" direction="Horizontal" default="0.15" variable="initial-fatigue-j"></slider>
+    <slider x="0" step="1" y="60" max="100" width="250" display="initial-mids" height="50" min="0" direction="Horizontal" default="10.0" variable="initial-mids"></slider>
+    <slider x="255" step="0.01" y="60" max="1" width="250" display="initial-fatigue-m" height="50" min="0" direction="Horizontal" default="0.25" variable="initial-fatigue-m"></slider>
+    <slider x="0" step="1" y="115" max="100" width="250" display="initial-seniors" height="50" min="0" direction="Horizontal" default="5.0" variable="initial-seniors"></slider>
+    <slider x="255" step="0.01" y="115" max="1" width="250" display="initial-fatigue-s" height="50" min="0" direction="Horizontal" default="0.35" variable="initial-fatigue-s"></slider>
+    <slider x="0" step="1" y="170" max="100" width="250" display="interaction-radius" height="50" min="0" direction="Horizontal" default="8.0" variable="interaction-radius"></slider>
+    <slider x="255" step="1" y="170" max="100" width="250" display="min-juniors" height="50" min="0" direction="Horizontal" default="60.0" variable="min-juniors"></slider>
+    <slider x="0" step="1" y="225" max="100" width="250" display="j-experience-threshold" height="50" min="0" direction="Horizontal" default="25.0" variable="j-experience-threshold"></slider>
+    <slider x="255" step="1" y="225" max="100" width="250" display="max-juniors" height="50" min="0" direction="Horizontal" default="100.0" variable="max-juniors"></slider>
+    <slider x="0" step="1" y="280" max="100" width="250" display="m-experience-threshold" height="50" min="0" direction="Horizontal" default="30.0" variable="m-experience-threshold"></slider>
+    <slider x="255" step="1" y="280" max="100" width="250" display="min-mids" height="50" min="0" direction="Horizontal" default="10.0" variable="min-mids"></slider>
+    <slider x="0" step="0.05" y="335" max="1" width="250" display="fatigue-std" height="50" min="0" direction="Horizontal" default="0.75" variable="fatigue-std"></slider>
+    <slider x="255" step="1" y="335" max="100" width="250" display="max-mids" height="50" min="0" direction="Horizontal" default="25.0" variable="max-mids"></slider>
+    <slider x="0" step="0.05" y="390" max="1" width="250" display="fatigue-resilience" height="50" min="0" direction="Horizontal" default="0.75" variable="fatigue-resilience"></slider>
+    <slider x="255" step="1" y="390" max="100" width="250" display="min-seniors" height="50" min="0" direction="Horizontal" default="5.0" variable="min-seniors"></slider>
+    <slider x="0" step="0.01" y="445" max="1" width="250" display="fatigue-increment" height="50" min="0" direction="Horizontal" default="0.18" variable="fatigue-increment"></slider>
+    <slider x="255" step="1" y="445" max="100" width="250" display="max-seniors" height="50" min="0" direction="Horizontal" default="15.0" variable="max-seniors"></slider>
+    <plot x="960" autoPlotX="true" yMax="100.0" autoPlotY="true" y="5" xMin="0.0" height="290" legend="true" xMax="100.0" yMin="0.0" width="460" display="Population">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="juniors" color="-8053223" legend="true">
+        <setup></setup>
+        <update>plot j-count</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="mids" color="-14730904" legend="true">
+        <setup></setup>
+        <update>plot m-count</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="seniors" color="-13210332" legend="true">
+        <setup></setup>
+        <update>plot s-count</update>
+      </pen>
+    </plot>
+    <slider x="730" step="1000" y="445" max="500000" width="225" display="maximal-cost" height="50" min="0" direction="Horizontal" default="251000.0" variable="maximal-cost"></slider>
+    <slider x="510" step="50" y="445" max="500" width="215" display="cost-increase" height="50" min="0" direction="Horizontal" default="50.0" variable="cost-increase"></slider>
+    <slider x="0" step="50" y="500" max="2000" width="250" display="initial-cost-j" height="50" min="0" direction="Horizontal" default="1500.0" variable="initial-cost-j"></slider>
+    <slider x="255" step="50" y="500" max="4000" width="250" display="initial-cost-m" height="50" min="0" direction="Horizontal" default="3000.0" variable="initial-cost-m"></slider>
+    <slider x="510" step="50" y="500" max="6000" width="250" display="initial-cost-s" height="50" min="0" direction="Horizontal" default="4500.0" variable="initial-cost-s"></slider>
+    <slider x="765" step="50" y="500" max="1000" width="190" display="hire-profit-threshold" height="50" min="0" direction="Horizontal" default="100.0" variable="hire-profit-threshold"></slider>
+    <slider x="0" step="1" y="555" max="100" width="250" display="hiring-cooldown" height="50" min="0" direction="Horizontal" default="0.0" variable="hiring-cooldown"></slider>
+    <slider x="255" step="50" y="555" max="1000" width="250" display="hire-profit-threshold-j" height="50" min="0" direction="Horizontal" default="350.0" variable="hire-profit-threshold-j"></slider>
+    <slider x="510" step="250" y="555" max="4000" width="250" display="hire-profit-threshold-m" height="50" min="0" direction="Horizontal" default="500.0" variable="hire-profit-threshold-m"></slider>
+    <slider x="765" step="500" y="555" max="10000" width="250" display="hire-profit-threshold-s" height="50" min="0" direction="Horizontal" default="1000.0" variable="hire-profit-threshold-s"></slider>
+    <slider x="0" step="1" y="610" max="100" width="250" display="morale-hit-radius" height="50" min="0" direction="Horizontal" default="5.0" variable="morale-hit-radius"></slider>
+    <slider x="255" step="0.001" y="610" max="1" width="250" display="morale-hit-amount" height="50" min="0" direction="Horizontal" default="0.005" variable="morale-hit-amount"></slider>
+    <slider x="510" step="1" y="610" max="100" width="250" display="manager-radius" height="50" min="0" direction="Horizontal" default="2.0" variable="manager-radius"></slider>
+    <slider x="765" step="0.25" y="610" max="2" width="250" display="manager-effectiveness-boost" height="50" min="0" direction="Horizontal" default="0.5" variable="manager-effectiveness-boost"></slider>
+    <slider x="0" step="1" y="665" max="1000" width="250" display="expansion-cooldown" height="50" min="0" direction="Horizontal" default="50.0" variable="expansion-cooldown"></slider>
+    <monitor x="1225" precision="17" y="490" height="60" fontSize="11" width="100" display="Cost">total-cost</monitor>
+    <monitor x="1330" precision="17" y="490" height="60" fontSize="11" width="100" display="profit">total-profit</monitor>
+    <monitor x="1435" precision="17" y="490" height="60" fontSize="11" width="100" display="Profit - Cost">total-profit - total-cost</monitor>
+    <monitor x="1425" precision="17" y="135" height="60" fontSize="11" width="105" display="J">j-count</monitor>
+    <monitor x="1425" precision="17" y="70" height="60" fontSize="11" width="105" display="M">m-count</monitor>
+    <monitor x="1425" precision="17" y="5" height="60" fontSize="11" width="105" display="S">s-count</monitor>
+    <button x="1425" y="200" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="105">setup</button>
+    <button x="1425" y="245" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="105">go</button>
+    <slider x="255" step="0.001" y="665" max="1" width="250" display="downsize-rate" height="50" min="0" direction="Horizontal" default="0.05" variable="downsize-rate"></slider>
+    <monitor x="1120" precision="17" y="490" height="60" fontSize="11" width="100" display="Budget">current-maximal-cost</monitor>
+    <plot x="965" autoPlotX="true" yMax="10.0" autoPlotY="true" y="300" xMin="0.0" height="185" legend="true" xMax="10.0" yMin="0.0" width="570" display="Financials">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="cost" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot total-cost</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="profit" color="-13840069" legend="true">
+        <setup></setup>
+        <update>plot total-profit</update>
+      </pen>
+    </plot>
+    <slider x="510" step="100" y="665" max="10000" width="250" display="employee-space-cost" height="50" min="0" direction="Horizontal" default="400.0" variable="employee-space-cost"></slider>
+    <slider x="765" step="0.05" y="665" max="100" width="250" display="profit-margin" height="50" min="0" direction="Horizontal" default="0.45" variable="profit-margin"></slider>
+    <slider x="960" step="0.05" y="500" max="10" width="150" display="expansion-margin" height="50" min="0" direction="Horizontal" default="0.55" variable="expansion-margin"></slider>
+    <slider x="1020" step="1" y="555" max="100" width="250" display="seek-radius" height="50" min="0" direction="Horizontal" default="60.0" variable="seek-radius"></slider>
+    <slider x="1020" step="1" y="610" max="100" width="250" display="experience-cost-scale" height="50" min="0" direction="Horizontal" default="20.0" variable="experience-cost-scale"></slider>
+    <slider x="1275" step="1" y="555" max="20" width="250" display="budget-expansion-margin" height="50" min="0" direction="Horizontal" default="1.0" variable="budget-expansion-margin"></slider>
+    <slider x="1275" step="1" y="610" max="250" width="250" display="budget-expansion-cooldown" height="50" min="0" direction="Horizontal" default="50.0" variable="budget-expansion-cooldown"></slider>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>
